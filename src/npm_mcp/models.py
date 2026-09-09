@@ -9,8 +9,8 @@ from pydantic import BaseModel, Field
 class TokenResponse(BaseModel):
     """Response from the login/token endpoint."""
 
-    token: str
-    expires: datetime
+    token: str | None = None
+    expires: datetime | None = None
 
 
 class UserMeta(BaseModel):

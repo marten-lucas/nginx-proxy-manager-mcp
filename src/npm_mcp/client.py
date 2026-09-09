@@ -48,6 +48,9 @@ class NpmClient:
         self._secret = secret or settings.secret
         self._token: str | None = None
         self._token_expires: datetime | None = None
+        # NPMplus puts the JWT in an HttpOnly cookie instead of a Bearer body
+        # field. Track which transport to use so requests carry the right header.
+        self._auth_mode: str = "bearer"  # either "bearer" or "cookie"
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def __aenter__(self) -> "NpmClient":
@@ -96,12 +99,28 @@ class NpmClient:
             raise NpmApiError(f"Login failed: {response.text}", status_code=response.status_code)
 
         data = response.json()
-        token_response = TokenResponse(**data)
 
-        self._token = token_response.token
+        # Vanilla NPM returns the JWT in the JSON body as {"token": ..., "expires": ...}.
+        # NPMplus instead returns only {"expires": ...} and places the JWT in an
+        # HttpOnly cookie named "__Host-Http-token" (value "s:<jwt>.<signature>").
+        token = data.get("token")
+        auth_mode = "bearer"
+        if not token:
+            token = response.cookies.get("__Host-Http-token")
+            auth_mode = "cookie"
+
+        if not token:
+            raise NpmAuthenticationError(
+                "No token in login response (neither JSON body nor cookie)"
+            )
+
+        token_response = TokenResponse(token=token, expires=data.get("expires"))
+
+        self._token = token
+        self._auth_mode = auth_mode
         self._token_expires = token_response.expires
 
-        logger.info("Successfully authenticated with NPM")
+        logger.info("Successfully authenticated with NPM (mode=%s)", auth_mode)
         return token_response
 
     def _is_token_valid(self) -> bool:
@@ -115,6 +134,18 @@ class NpmClient:
         """Ensure we have a valid token, refreshing if needed."""
         if not self._is_token_valid():
             await self.login()
+
+    def _apply_auth_header(self, headers: dict) -> None:
+        """Add the appropriate auth header based on the login transport.
+
+        Vanilla NPM uses ``Authorization: Bearer <token>``; NPMplus uses the
+        ``__Host-Http-token`` cookie (HttpOnly) instead. The cookie value may
+        contain a URL-encoded signature, so pass it through unchanged.
+        """
+        if self._auth_mode == "cookie":
+            headers["Cookie"] = f"__Host-Http-token={self._token}"
+        else:
+            headers["Authorization"] = f"Bearer {self._token}"
 
     # -------------------------------------------------------------------------
     # Base Request Handler
@@ -145,7 +176,7 @@ class NpmClient:
         await self._ensure_authenticated()
 
         headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {self._token}"
+        self._apply_auth_header(headers)
 
         url = f"{self.base_url}{endpoint}"
 
@@ -160,7 +191,7 @@ class NpmClient:
         if response.status_code == 401:
             logger.info("Token expired, re-authenticating...")
             await self.login()
-            headers["Authorization"] = f"Bearer {self._token}"
+            self._apply_auth_header(headers)
             response = await self._client.request(method, url, headers=headers, **kwargs)
 
             if response.status_code == 401:
